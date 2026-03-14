@@ -5,13 +5,15 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-V18.2-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-V18.3-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Cloudflare%20Workers-orange">
   <img alt="storage" src="https://img.shields.io/badge/storage-KV%20%2B%20D1-green">
   <img alt="ui" src="https://img.shields.io/badge/panel-SaaS%20UI-purple">
 </p>
 
 > 一个单文件 `worker.js` 项目：统一多台 Emby 节点入口、隐藏源站 IP、支持直连/反代混合策略、提供 `/admin` 可视化后台，并集成日志、Cloudflare 统计、Telegram 日报与多层缓存优化。
+
+> 当前版本 `V18.3`：新增节点多线路与面板测速策略控制，并收紧外部重定向鉴权为默认 `fail closed`。
 
 <img width="2560" height="2497" alt="图片" src="https://github.com/user-attachments/assets/9348e71f-bf9f-47c4-944d-7f94d0d6bdde" />
 

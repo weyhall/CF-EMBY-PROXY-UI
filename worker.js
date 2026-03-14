@@ -1,4 +1,4 @@
-// EMBY-PROXY-UI V18.2 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
+// EMBY-PROXY-UI V18.3 (SaaS UI Optimized - Ultimate Fix + Emby Auth Patch)
 
 // 单文件导航图（保持单文件部署，不做物理解耦）：
 // 0. 全局状态与通用工具
@@ -97,6 +97,8 @@ const Config = {
     DashboardAutoRefreshSeconds: 30,
     CacheTtlImagesDays: 30,
     PingTimeoutMs: 5000,
+    PingCacheMinutes: 10,
+    NodePanelPingAutoSort: false,
     TgAlertDroppedBatchThreshold: 0,
     TgAlertFlushRetryThreshold: 0,
     TgAlertCooldownMinutes: 30,
@@ -108,8 +110,8 @@ const Config = {
     ConfigSnapshotLimit: 5,
     CleanupBudgetMs: 1,             
     CleanupChunkSize: 64,           
-    AssetHash: "v18.2",           
-    Version: "18.2"                 
+    AssetHash: "v18.3",           
+    Version: "18.3"                 
   }
 };
 
@@ -765,6 +767,7 @@ const CONFIG_SANITIZE_RULES = {
     tgAlertCooldownMinutes: { fallback: Config.Defaults.TgAlertCooldownMinutes, min: 1, max: 1440 },
     cacheTtlImages: { fallback: Config.Defaults.CacheTtlImagesDays, min: 0, max: 365 },
     pingTimeout: { fallback: Config.Defaults.PingTimeoutMs, min: 1000, max: 180000 },
+    pingCacheMinutes: { fallback: Config.Defaults.PingCacheMinutes, min: 0, max: 1440 },
     upstreamTimeoutMs: { fallback: Config.Defaults.UpstreamTimeoutMs, min: 0, max: 180000 },
     upstreamRetryAttempts: { fallback: Config.Defaults.UpstreamRetryAttempts, min: 0, max: 3 },
     prewarmCacheTtl: { fallback: Config.Defaults.PrewarmCacheTtl, min: 0, max: 3600 },
@@ -774,7 +777,7 @@ const CONFIG_SANITIZE_RULES = {
     logWriteDelayMinutes: { fallback: Config.Defaults.LogFlushDelayMinutes, min: 0, max: 1440 }
   },
   booleanTrueFields: [],
-  booleanFalseFields: ["dashboardAutoRefreshEnabled", "tgAlertOnScheduledFailure", "directStaticAssets", "directHlsDash", "disablePrewarmPrefetch"]
+  booleanFalseFields: ["dashboardAutoRefreshEnabled", "tgAlertOnScheduledFailure", "directStaticAssets", "directHlsDash", "disablePrewarmPrefetch", "nodePanelPingAutoSort"]
 };
 
 function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, helpers = {}) {
@@ -1447,10 +1450,153 @@ const Database = {
     }
     return normalized.length ? normalized.join(",") : null;
   },
+  normalizeSingleTarget(targetValue) {
+    const normalizedTargets = this.normalizeTargets(targetValue);
+    if (!normalizedTargets) return null;
+    const [firstTarget] = normalizedTargets.split(",").map(item => item.trim()).filter(Boolean);
+    return firstTarget || null;
+  },
+  buildDefaultLineName(index) {
+    return `线路${Number(index) + 1}`;
+  },
+  normalizeLineId(value, fallbackIndex = 0) {
+    const normalized = String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return normalized || `line-${Number(fallbackIndex) + 1}`;
+  },
+  normalizeIsoDatetime(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : "";
+  },
+  normalizeLines(rawLines, fallbackTarget = "") {
+    const sourceLines = Array.isArray(rawLines) && rawLines.length
+      ? rawLines
+      : String(this.normalizeTargets(fallbackTarget) || "")
+          .split(",")
+          .map(item => item.trim())
+          .filter(Boolean)
+          .map((target, index) => ({
+            id: `line-${index + 1}`,
+            name: this.buildDefaultLineName(index),
+            target
+          }));
+    if (!sourceLines.length) return [];
+
+    const normalized = [];
+    const usedIds = new Set();
+    sourceLines.forEach((rawLine, index) => {
+      const line = rawLine && typeof rawLine === "object" && !Array.isArray(rawLine)
+        ? rawLine
+        : { target: rawLine };
+      const target = this.normalizeSingleTarget(line?.target);
+      if (!target) return;
+
+      const baseId = this.normalizeLineId(line?.id, index);
+      let nextId = baseId;
+      let suffix = 2;
+      while (usedIds.has(nextId)) {
+        nextId = `${baseId}-${suffix}`;
+        suffix += 1;
+      }
+      usedIds.add(nextId);
+
+      const latencyCandidate = Number(line?.latencyMs);
+      normalized.push({
+        id: nextId,
+        name: String(line?.name || "").trim() || this.buildDefaultLineName(index),
+        target,
+        latencyMs: Number.isFinite(latencyCandidate) && latencyCandidate >= 0 ? Math.round(latencyCandidate) : null,
+        latencyUpdatedAt: this.normalizeIsoDatetime(line?.latencyUpdatedAt)
+      });
+    });
+    return normalized;
+  },
+  resolveActiveLineId(activeLineId, lines, rawLines = []) {
+    if (!Array.isArray(lines) || !lines.length) return "";
+    const explicitId = String(activeLineId || "").trim();
+    if (explicitId && lines.some(line => line.id === explicitId)) return explicitId;
+
+    if (Array.isArray(rawLines)) {
+      for (const rawLine of rawLines) {
+        if (!rawLine || typeof rawLine !== "object" || Array.isArray(rawLine) || rawLine.enabled !== true) continue;
+        const rawId = String(rawLine.id || "").trim();
+        if (rawId && lines.some(line => line.id === rawId)) return rawId;
+        const rawTarget = this.normalizeSingleTarget(rawLine.target);
+        if (!rawTarget) continue;
+        const matched = lines.find(line => line.target === rawTarget);
+        if (matched) return matched.id;
+      }
+    }
+
+    return lines[0].id;
+  },
+  buildLegacyTargetFromLines(lines = []) {
+    return (Array.isArray(lines) ? lines : [])
+      .map(line => String(line?.target || "").trim())
+      .filter(Boolean)
+      .join(",");
+  },
+  getActiveNodeLine(node) {
+    const lines = Array.isArray(node?.lines) ? node.lines : [];
+    if (!lines.length) return null;
+    const activeLineId = String(node?.activeLineId || "").trim();
+    return lines.find(line => line.id === activeLineId) || lines[0];
+  },
+  getOrderedNodeLines(node) {
+    const lines = Array.isArray(node?.lines) ? node.lines.slice() : [];
+    if (lines.length <= 1) return lines;
+    const activeLine = this.getActiveNodeLine(node);
+    if (!activeLine) return lines;
+    return [activeLine, ...lines.filter(line => line.id !== activeLine.id)];
+  },
+  sortNodeLinesByLatency(lines = []) {
+    return (Array.isArray(lines) ? lines : [])
+      .map((line, index) => ({ line, index }))
+      .sort((left, right) => {
+        const leftMs = Number.isFinite(left.line?.latencyMs) ? left.line.latencyMs : Number.POSITIVE_INFINITY;
+        const rightMs = Number.isFinite(right.line?.latencyMs) ? right.line.latencyMs : Number.POSITIVE_INFINITY;
+        if (leftMs !== rightMs) return leftMs - rightMs;
+        return left.index - right.index;
+      })
+      .map(item => item.line);
+  },
+  isPingCacheFresh(line, cacheMinutes) {
+    const latencyMs = Number(line?.latencyMs);
+    const checkedAt = Date.parse(String(line?.latencyUpdatedAt || ""));
+    if (!Number.isFinite(latencyMs) || !Number.isFinite(checkedAt)) return false;
+    const ttlMs = Math.max(0, Number(cacheMinutes) || 0) * 60 * 1000;
+    if (ttlMs <= 0) return false;
+    return nowMs() - checkedAt < ttlMs;
+  },
+  async pingTarget(target, timeoutMs) {
+    const controller = new AbortController();
+    const startedAt = nowMs();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      await fetch(target, { method: "HEAD", signal: controller.signal });
+      return nowMs() - startedAt;
+    } catch {
+      return 9999;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
   normalizeNode(nodeName, data) {
     const n = { ...data };
     let changed = false;
-    if (!n.target) { n.target = ""; changed = true; }
+    const normalizedLines = this.normalizeLines(n.lines, n.target);
+    const nextActiveLineId = this.resolveActiveLineId(n.activeLineId, normalizedLines, Array.isArray(n.lines) ? n.lines : []);
+    const legacyTarget = this.buildLegacyTargetFromLines(normalizedLines);
+    if (JSON.stringify(normalizedLines) !== JSON.stringify(Array.isArray(n.lines) ? n.lines : [])) changed = true;
+    if (String(n.activeLineId || "") !== nextActiveLineId) changed = true;
+    if (String(n.target || "") !== legacyTarget) changed = true;
+    n.lines = normalizedLines;
+    n.activeLineId = nextActiveLineId;
+    n.target = legacyTarget;
     if (n.secret === undefined) { n.secret = ""; changed = true; }
     if (n.tag === undefined) { n.tag = ""; changed = true; }
     if (n.remark === undefined) { n.remark = ""; changed = true; }
@@ -1459,7 +1605,7 @@ const Database = {
     n.headers = normalizedHeaders;
     delete n.videoThrottling;
     delete n.interceptMs;
-    if (!n.schemaVersion) { n.schemaVersion = 2; changed = true; }
+    if (n.schemaVersion !== 3) { n.schemaVersion = 3; changed = true; }
     if (!n.createdAt) { n.createdAt = new Date().toISOString(); changed = true; }
     if (!n.updatedAt) { n.updatedAt = n.createdAt; changed = true; }
     return { data: n, changed };
@@ -1469,15 +1615,26 @@ const Database = {
     if (typeof parsedHeaders === "string") {
       try { parsedHeaders = JSON.parse(parsedHeaders); } catch { parsedHeaders = {}; }
     }
-    const normalizedTargets = this.normalizeTargets(rawNode?.target || existingNode.target);
-    if (!normalizedTargets) return null;
+    const candidateRawLines = Array.isArray(rawNode?.lines)
+      ? rawNode.lines
+      : (rawNode?.target !== undefined ? [] : existingNode.lines);
+    const candidateFallbackTarget = rawNode?.target !== undefined ? rawNode.target : existingNode.target;
+    const normalizedLines = this.normalizeLines(candidateRawLines, candidateFallbackTarget);
+    if (!normalizedLines.length) return null;
+    const nextActiveLineId = this.resolveActiveLineId(
+      rawNode?.activeLineId !== undefined ? rawNode.activeLineId : existingNode.activeLineId,
+      normalizedLines,
+      Array.isArray(rawNode?.lines) ? rawNode.lines : existingNode.lines
+    );
     return this.normalizeNode(name, {
-      target: normalizedTargets,
+      target: this.buildLegacyTargetFromLines(normalizedLines),
+      lines: normalizedLines,
+      activeLineId: nextActiveLineId,
       secret: rawNode?.secret !== undefined ? rawNode.secret : (existingNode.secret || ""),
       tag: rawNode?.tag !== undefined ? rawNode.tag : (existingNode.tag || ""),
       remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
       headers: this.sanitizeHeaders(parsedHeaders),
-      schemaVersion: 2,
+      schemaVersion: 3,
       createdAt: existingNode.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString()
     }).data;
@@ -1775,7 +1932,7 @@ const Database = {
       let index = await Database.getNodesIndex(kv);
       
       for (const n of nodesToSave) {
-        if (!n.name || !n.target) continue;
+        if (!n.name || (!n.target && !(Array.isArray(n.lines) && n.lines.length))) continue;
         const name = String(n.name).toLowerCase();
         const originalName = n.originalName ? String(n.originalName).toLowerCase() : null;
         const isRename = !!(originalName && originalName !== name);
@@ -1828,7 +1985,7 @@ const Database = {
           const savedNodes = [];
           let index = await Database.getNodesIndex(kv);
           for (const n of data.nodes) {
-            if (!n.name || !n.target) continue;
+            if (!n.name || (!n.target && !(Array.isArray(n.lines) && n.lines.length))) continue;
             const name = String(n.name).toLowerCase(); 
             const existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
             const val = Database.buildNodeRecord(name, n, existingNode);
@@ -1893,19 +2050,88 @@ const Database = {
     },
 
     async pingNode(data, { env, ctx }) {
-        const node = await Database.getNode(data.name, env, ctx);
-        if (!node || !node.target) return jsonError("NOT_FOUND", "节点不存在");
-        const targets = String(node.target).split(",").map(i => i.trim()).filter(Boolean);
-        const start = Date.now();
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), parseInt(data.timeout || 5000));
-            await fetch(targets[0], { method: 'HEAD', signal: controller.signal });
-            clearTimeout(timeoutId);
-            return jsonResponse({ ms: Date.now() - start });
-        } catch (e) {
-            return jsonResponse({ ms: 9999 });
+        const currentConfig = await getRuntimeConfig(env);
+        const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? Config.Defaults.PingTimeoutMs, 1000, 180000);
+        const forceRefresh = data.forceRefresh === true;
+
+        if (data.target) {
+          const normalizedTarget = Database.normalizeSingleTarget(data.target);
+          if (!normalizedTarget) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+          const ms = await Database.pingTarget(normalizedTarget, timeoutMs);
+          return jsonResponse({ ms, target: normalizedTarget, usedCache: false, scope: "target" });
         }
+
+        const nodeName = String(data.name || "").trim();
+        const node = await Database.getNode(nodeName, env, ctx);
+        if (!node || !Array.isArray(node.lines) || !node.lines.length) return jsonError("NOT_FOUND", "节点不存在");
+
+        const cacheMinutes = clampIntegerConfig(currentConfig.pingCacheMinutes, Config.Defaults.PingCacheMinutes, 0, 1440);
+        const requestedLineId = String(data.lineId || "").trim();
+        const silent = data.silent === true && !!requestedLineId;
+        const linesToProbe = requestedLineId
+          ? node.lines.filter(line => line.id === requestedLineId)
+          : node.lines.slice();
+        if (requestedLineId && !linesToProbe.length) return jsonError("LINE_NOT_FOUND", "线路不存在", 404);
+
+        const probedLines = await Promise.all(linesToProbe.map(async (line) => {
+          const useCache = !forceRefresh && Database.isPingCacheFresh(line, cacheMinutes);
+          if (useCache) return { ...line, usedCache: true };
+          const ms = await Database.pingTarget(line.target, timeoutMs);
+          return {
+            ...line,
+            latencyMs: ms,
+            latencyUpdatedAt: new Date().toISOString(),
+            usedCache: false
+          };
+        }));
+
+        let allUsedCache = probedLines.length > 0 && probedLines.every(line => line.usedCache === true);
+        let nextLines = node.lines.map(line => {
+          const updated = probedLines.find(item => item.id === line.id);
+          return updated
+            ? {
+                id: updated.id,
+                name: updated.name,
+                target: updated.target,
+                latencyMs: updated.latencyMs,
+                latencyUpdatedAt: updated.latencyUpdatedAt
+              }
+            : line;
+        });
+        let nextActiveLineId = Database.resolveActiveLineId(node.activeLineId, nextLines, nextLines);
+
+        if (!silent) {
+          nextLines = Database.sortNodeLinesByLatency(nextLines);
+          nextActiveLineId = nextLines[0]?.id || nextActiveLineId;
+        }
+
+        const normalizedNode = Database.normalizeNode(nodeName, {
+          ...node,
+          lines: nextLines,
+          activeLineId: nextActiveLineId,
+          updatedAt: new Date().toISOString()
+        }).data;
+
+        const kv = Database.getKV(env);
+        if (kv) {
+          await kv.put(`${Database.PREFIX}${nodeName.toLowerCase()}`, JSON.stringify(normalizedNode));
+          Database.invalidateNodeCaches(nodeName, { invalidateList: true });
+          GLOBALS.NodeCache.set(nodeName.toLowerCase(), { data: normalizedNode, exp: nowMs() + Config.Defaults.CacheTTL });
+        }
+
+        const activeLine = Database.getActiveNodeLine(normalizedNode);
+        const matchedLine = requestedLineId
+          ? normalizedNode.lines.find(line => line.id === requestedLineId)
+          : activeLine;
+        return jsonResponse({
+          ms: Number(matchedLine?.latencyMs ?? activeLine?.latencyMs ?? 9999),
+          usedCache: allUsedCache,
+          sorted: !silent,
+          activeLineId: normalizedNode.activeLineId,
+          activeLineName: activeLine?.name || "",
+          line: matchedLine || null,
+          node: { name: nodeName.toLowerCase(), ...normalizedNode }
+        });
     },
 
     async getLogs(data, { db }) {
@@ -2119,7 +2345,11 @@ const Proxy = {
     return null;
   },
   parseTargetBases(node, finalOrigin) {
-    const targetBases = String(node.target || "").split(",").map(item => item.trim()).filter(Boolean).map(item => {
+    const orderedLines = Database.getOrderedNodeLines(node);
+    const rawTargets = orderedLines.length
+      ? orderedLines.map(line => line.target)
+      : String(node.target || "").split(",").map(item => item.trim()).filter(Boolean);
+    const targetBases = rawTargets.map(item => {
       try { return new URL(item); } catch { return null; }
     }).filter(url => url && ["http:", "https:"].includes(url.protocol));
     if (!targetBases.length) {
@@ -2127,7 +2357,7 @@ const Proxy = {
     }
     return { targetBases, invalidResponse: null };
   },
-  buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases) {
+  async buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases) {
     const newHeaders = new Headers(request.headers);
     GLOBALS.DropRequestHeaders.forEach(h => newHeaders.delete(h));
 
@@ -2164,16 +2394,27 @@ const Proxy = {
     }
 
     const isNonIdempotent = request.method !== "GET" && request.method !== "HEAD";
-    const preparedBody = isNonIdempotent ? request.body : null;
-    const preparedBodyMode = (isNonIdempotent && request.body) ? "stream" : "none";
+    let preparedBody = null;
+    let preparedBodyMode = "none";
+    if (isNonIdempotent && request.body) {
+      try {
+        preparedBody = await request.clone().arrayBuffer();
+        preparedBodyMode = "buffered";
+      } catch {
+        preparedBody = request.body;
+        preparedBodyMode = "stream";
+      }
+    }
     const retryTargets = isNonIdempotent ? targetBases.slice(0, 1) : targetBases;
+    const allowAutomaticRetry = !isNonIdempotent;
 
     return {
       newHeaders,
       adminCustomHeaders,
       preparedBody,
       preparedBodyMode,
-      retryTargets
+      retryTargets,
+      allowAutomaticRetry
     };
   },
   evaluateRedirectDecision(nextUrl, activeTargetBase, redirectMethod, redirectBodyMode, policy) {
@@ -2329,12 +2570,11 @@ const Proxy = {
     if (response.status !== 403) return false;
     if (state.isRetry !== false) return false;
     if (state.protocolFallback !== true) return false;
+    if (state.allowAutomaticRetry !== true) return false;
     if (state.preparedBodyMode === "stream") return false;
     return true;
   },
-  async performUpstreamFetch(targetBase, proxyPath, requestUrl, buildFetchOptions, options = {}) {
-    const finalUrl = new URL(proxyPath, targetBase);
-    finalUrl.search = requestUrl.search;
+  async performFetchWithTimeout(finalUrl, buildFetchOptions, options = {}) {
     const fetchOptions = await buildFetchOptions(finalUrl, options);
     const timeoutMs = Math.max(0, Number(options.timeoutMs) || 0);
     let timeoutId = null;
@@ -2346,7 +2586,7 @@ const Proxy = {
     }
     try {
       const response = await fetch(finalUrl.toString(), fetchOptions);
-      return { response, targetBase, finalUrl };
+      return { response, finalUrl };
     } catch (error) {
       if (timeoutMs > 0 && (error?.name === "AbortError" || String(error?.message || "").toLowerCase().includes("abort"))) {
         /** @type {AppError} */
@@ -2358,6 +2598,56 @@ const Proxy = {
     } finally {
       if (timeoutId !== null) clearTimeout(timeoutId);
     }
+  },
+  async performUpstreamFetch(targetBase, proxyPath, requestUrl, buildFetchOptions, options = {}) {
+    const finalUrl = new URL(proxyPath, targetBase);
+    finalUrl.search = requestUrl.search;
+    const result = await this.performFetchWithTimeout(finalUrl, buildFetchOptions, options);
+    return { ...result, targetBase };
+  },
+  async fetchAbsoluteWithRetryLoop(state) {
+    let lastError = null;
+    let lastResponse = null;
+    const absoluteUrl = state.absoluteUrl instanceof URL ? new URL(state.absoluteUrl.toString()) : new URL(String(state.absoluteUrl || ""));
+    const totalPasses = Math.max(1, clampIntegerConfig(state.maxExtraAttempts, Config.Defaults.UpstreamRetryAttempts, 0, 3) + 1);
+
+    for (let pass = 0; pass < totalPasses; pass++) {
+      const effectiveRetry = state.isRetry === true || pass > 0;
+      try {
+        const upstream = await this.performFetchWithTimeout(absoluteUrl, state.buildFetchOptions, {
+          ...state.fetchOptions,
+          isRetry: effectiveRetry,
+          timeoutMs: state.upstreamTimeoutMs
+        });
+        const response = upstream.response;
+
+        if (response.status === 101) {
+          return upstream;
+        }
+
+        if (this.shouldRetryWithProtocolFallback(response, { ...state, isRetry: effectiveRetry })) {
+          try { response.body?.cancel?.(); } catch {}
+          return await this.fetchAbsoluteWithRetryLoop({ ...state, isRetry: true });
+        }
+
+        const isLastPass = pass === totalPasses - 1;
+        if (state.allowAutomaticRetry !== true || !state.retryableStatuses.has(response.status) || isLastPass) {
+          return upstream;
+        }
+
+        if (lastResponse) {
+          try { lastResponse.body?.cancel?.(); } catch {}
+        }
+        lastResponse = response;
+      } catch (error) {
+        lastError = error;
+        const isLastPass = pass === totalPasses - 1;
+        if (state.allowAutomaticRetry !== true || isLastPass) throw error;
+      }
+    }
+
+    if (lastResponse) return { response: lastResponse, finalUrl: absoluteUrl };
+    throw lastError || new Error("redirect_fetch_failed");
   },
   async fetchUpstreamWithRetryLoop(state) {
     let lastError = null;
@@ -2391,7 +2681,7 @@ const Proxy = {
 
           const isLastTarget = index === state.retryTargets.length - 1;
           const isLastPass = pass === totalPasses - 1;
-          if (!state.retryableStatuses.has(response.status) || (isLastTarget && isLastPass)) {
+          if (state.allowAutomaticRetry !== true || !state.retryableStatuses.has(response.status) || (isLastTarget && isLastPass)) {
             return upstream;
           }
 
@@ -2465,8 +2755,8 @@ const Proxy = {
 
     const { targetBases, invalidResponse } = this.parseTargetBases(node, finalOrigin);
     if (invalidResponse) return invalidResponse;
-    const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode, retryTargets } =
-      this.buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases);
+    const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode, retryTargets, allowAutomaticRetry } =
+      await this.buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetBases);
 
     const sourceSameOriginProxy = currentConfig.sourceSameOriginProxy !== false;
     const forceExternalProxy = currentConfig.forceExternalProxy !== false;
@@ -2501,7 +2791,7 @@ const Proxy = {
       if (isExternalRedirect) {
         headers.delete("Authorization");
         headers.delete("X-Emby-Authorization");
-        if (!adminCustomHeaders.has("cookie")) headers.delete("Cookie");
+        headers.delete("Cookie");
         if (!adminCustomHeaders.has("origin")) headers.delete("Origin");
         if (!adminCustomHeaders.has("referer")) headers.delete("Referer");
       }
@@ -2556,8 +2846,9 @@ const Proxy = {
         retryableStatuses,
         protocolFallback,
         preparedBodyMode,
+        allowAutomaticRetry,
         upstreamTimeoutMs,
-        maxExtraAttempts: preparedBodyMode === "stream" ? 0 : upstreamRetryAttempts,
+        maxExtraAttempts: allowAutomaticRetry ? upstreamRetryAttempts : 0,
         isRetry: false
       });
       response = upstream.response;
@@ -2591,14 +2882,25 @@ const Proxy = {
 
         try { response.body?.cancel?.(); } catch {}
 
-        const redirectFetchOptions = await buildFetchOptions(nextUrl, {
-          method: nextMethod,
-          bodyMode: nextBodyMode,
-          body: nextBody,
-          isExternalRedirect: !redirectDecision.isSameOriginRedirect
+        const redirectUpstream = await this.fetchAbsoluteWithRetryLoop({
+          absoluteUrl: nextUrl,
+          buildFetchOptions,
+          fetchOptions: {
+            method: nextMethod,
+            bodyMode: nextBodyMode,
+            body: nextBody,
+            isExternalRedirect: !redirectDecision.isSameOriginRedirect
+          },
+          retryableStatuses,
+          protocolFallback,
+          preparedBodyMode: nextBodyMode,
+          allowAutomaticRetry,
+          upstreamTimeoutMs,
+          maxExtraAttempts: allowAutomaticRetry ? upstreamRetryAttempts : 0,
+          isRetry: false
         });
-        response = await fetch(nextUrl.toString(), redirectFetchOptions);
-        finalUrl = nextUrl;
+        response = redirectUpstream.response;
+        finalUrl = redirectUpstream.finalUrl;
         redirectMethod = nextMethod;
         redirectBodyMode = nextBodyMode;
         redirectBody = nextBody;
@@ -2902,7 +3204,7 @@ const UI_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Emby Proxy V18.2 - SaaS Dashboard</title>
+  <title>Emby Proxy V18.3 - SaaS Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -2981,7 +3283,7 @@ const UI_HTML = `<!DOCTYPE html>
       <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold text-lg flex-shrink-0">E</div>
       <h1 class="ml-3 font-semibold tracking-tight text-lg flex items-center gap-2">
         Emby Proxy 
-        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.2</span>
+        <span class="px-1.5 py-0.5 rounded bg-brand-100 text-brand-600 dark:bg-brand-500/20 dark:text-brand-400 text-[10px] font-bold mt-0.5">V18.3</span>
       </h1>
     </div>
     <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-1">
@@ -3284,7 +3586,18 @@ const UI_HTML = `<!DOCTYPE html>
                       <input type="number" min="1000" max="180000" step="500" id="cfg-ping-timeout" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="5000">
                       <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">ms</span>
                     </div>
-                    <p class="text-xs text-slate-500">系统会限制在 1000 到 180000 毫秒之间，避免探测等待时间过长拖住后台操作。</p>
+                    <p class="text-xs text-slate-500 mb-3">系统会限制在 1000 到 180000 毫秒之间，避免探测等待时间过长拖住后台操作。</p>
+                    <label class="block text-sm text-slate-500 mb-1">Ping 缓存时间</label>
+                    <div class="relative">
+                      <input type="number" min="0" max="1440" step="1" id="cfg-ping-cache-minutes" class="w-full p-2 pr-12 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 outline-none mb-2 dark:text-white" value="10">
+                      <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-slate-400">分钟</span>
+                    </div>
+                    <p class="text-xs text-slate-500">缓存只用于自动复用历史测速结果；用户手动触发单点测速、节点测速或全局 Ping 时会直接重测并覆盖旧值。</p>
+                    <label class="flex items-start gap-3 text-sm font-medium cursor-pointer text-slate-900 dark:text-white mt-4">
+                      <input type="checkbox" id="cfg-node-panel-ping-auto-sort" class="mt-0.5 w-4 h-4 rounded">
+                      <span>节点面板一键测速后自动按延迟排序并切换到最低延迟线路</span>
+                    </label>
+                    <p class="text-xs text-slate-500 mt-2">默认关闭。仅影响“新建节点 / 编辑节点”面板的一键测试延迟；全局 Ping 与节点卡片 Ping 只测试当前启用线路，不自动排序。</p>
                   </div>
 
                   <div class="rounded-3xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/40 p-5 shadow-sm settings-block h-full">
@@ -3692,23 +4005,43 @@ const UI_HTML = `<!DOCTYPE html>
     </div>
   </main>
 
-  <dialog id="node-modal" class="backdrop:bg-slate-950/60 bg-transparent w-11/12 md:w-full max-w-xl m-auto p-0">
+  <dialog id="node-modal" class="backdrop:bg-slate-950/60 bg-transparent w-11/12 md:w-full max-w-6xl m-auto p-0">
     <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 shadow-2xl">
       <h2 class="text-xl font-bold mb-4 text-slate-900 dark:text-white" id="node-modal-title">新建节点</h2>
      <form onsubmit="App.saveNode(event)" class="space-y-4 max-h-[calc(80vh-env(safe-area-inset-bottom)-env(safe-area-inset-top))] overflow-y-auto pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[max(0.5rem,env(safe-area-inset-right))]">
-        <input type="hidden" id="form-original-name">
-        <div><label class="block text-sm text-slate-500 mb-1">节点名称</label><input type="text" id="form-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" required></div>
-        <div><label class="block text-sm text-slate-500 mb-1">目标源站 (Target)</label><input type="url" id="form-target" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white" required></div>
-        
-        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
-        
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div><label class="block text-sm text-slate-500 mb-1">标签</label><input type="text" id="form-tag" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
-          <div><label class="block text-sm text-slate-500 mb-1">备注</label><input type="text" id="form-remark" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
-        </div>
-        
-        <div class="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
-          <label class="block text-sm font-medium mb-2 text-slate-900 dark:text-white">自定义请求头 (覆盖或新增)</label>
+	        <input type="hidden" id="form-original-name">
+	        <input type="hidden" id="form-active-line-id">
+	        <div><label class="block text-sm text-slate-500 mb-1">节点名称</label><input type="text" id="form-name" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 outline-none text-sm text-slate-900 dark:text-white" required></div>
+	        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+	          <div><label class="block text-sm text-slate-500 mb-1">标签</label><input type="text" id="form-tag" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+	          <div><label class="block text-sm text-slate-500 mb-1">备注</label><input type="text" id="form-remark" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+	        </div>
+	        
+	        <div><label class="block text-sm text-slate-500 mb-1">访问鉴权 (Secret, 可留空)</label><input type="text" id="form-secret" class="w-full px-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white"></div>
+	        
+	        <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/50 p-4">
+	          <div class="flex items-center justify-between gap-3 mb-3">
+	            <div>
+	              <label class="block text-sm text-slate-500">线路列表</label>
+		              <p class="text-xs text-slate-400 mt-1">支持单节点多线路、手动启用、桌面端整行拖拽排序和一键延迟测试；是否自动排序可在全局设置中控制。</p>
+	            </div>
+	            <div class="flex items-center gap-2">
+	              <button type="button" onclick="App.pingAllNodeLinesInModal(event)" class="px-3 py-2 rounded-xl border border-emerald-200 text-emerald-600 hover:bg-emerald-50 dark:border-emerald-900/30 dark:text-emerald-400 dark:hover:bg-emerald-900/20 text-sm font-medium transition">一键测试延迟</button>
+	              <button type="button" onclick="App.addNodeLine()" class="px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium transition">+ 添加线路</button>
+	            </div>
+	          </div>
+	          <div class="hidden md:grid md:grid-cols-[88px_1.15fr_2.1fr_92px_164px] gap-3 px-3 pb-2 text-[11px] font-semibold tracking-[0.1em] uppercase text-slate-400">
+	            <span>启用</span>
+	            <span>线路名称</span>
+	            <span>目标源站</span>
+	            <span>延迟</span>
+	            <span>拖拽 / 删除</span>
+	          </div>
+	          <div id="node-lines-container" class="space-y-3"></div>
+	        </div>
+	        
+	        <div class="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
+	          <label class="block text-sm font-medium mb-2 text-slate-900 dark:text-white">自定义请求头 (覆盖或新增)</label>
           <div id="headers-container" class="space-y-2 mb-3"></div>
           <button type="button" onclick="App.addHeaderRow()" class="text-xs font-medium text-brand-600 hover:text-brand-700 bg-brand-50 dark:bg-brand-500/10 dark:text-brand-400 px-3 py-1.5 rounded-lg transition">+ 添加请求头</button>
         </div>
@@ -3731,6 +4064,8 @@ const UI_HTML = `<!DOCTYPE html>
       prewarmCacheTtl: 180,
       prewarmPrefetchBytes: 4194304,
       pingTimeout: 5000,
+      pingCacheMinutes: 10,
+      nodePanelPingAutoSort: false,
       upstreamTimeoutMs: 0,
       upstreamRetryAttempts: 0,
       logRetentionDays: 7,
@@ -3768,6 +4103,8 @@ const UI_HTML = `<!DOCTYPE html>
         { key: 'forceExternalProxy', id: 'cfg-force-external-proxy', kind: 'checkbox', checkboxMode: 'defaultTrue' },
         { key: 'wangpandirect', id: 'cfg-wangpandirect', kind: 'trim', loadMode: 'or-default', defaultValue: '${DEFAULT_WANGPAN_DIRECT_TEXT}' },
         { key: 'pingTimeout', id: 'cfg-ping-timeout', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.pingTimeout },
+        { key: 'pingCacheMinutes', id: 'cfg-ping-cache-minutes', kind: 'int-or-default', loadMode: 'number-finite', defaultValue: UI_DEFAULTS.pingCacheMinutes },
+        { key: 'nodePanelPingAutoSort', id: 'cfg-node-panel-ping-auto-sort', kind: 'checkbox', checkboxMode: 'strictTrue' },
         { key: 'upstreamTimeoutMs', id: 'cfg-upstream-timeout-ms', kind: 'int-finite', defaultValue: UI_DEFAULTS.upstreamTimeoutMs },
         { key: 'upstreamRetryAttempts', id: 'cfg-upstream-retry-attempts', kind: 'int-finite', defaultValue: UI_DEFAULTS.upstreamRetryAttempts }
       ],
@@ -3828,6 +4165,8 @@ const UI_HTML = `<!DOCTYPE html>
       wangpandirect: 'wangpandirect 关键词',
       sourceDirectNodes: '源站直连节点名单',
       pingTimeout: 'Ping 超时',
+      pingCacheMinutes: 'Ping 缓存时间',
+      nodePanelPingAutoSort: '节点面板 Ping 自动排序',
       upstreamTimeoutMs: '上游握手超时',
       upstreamRetryAttempts: '额外重试轮次',
       geoAllowlist: '国家/地区白名单',
@@ -3879,6 +4218,8 @@ const UI_HTML = `<!DOCTYPE html>
         sourceSameOriginProxy: true,
         forceExternalProxy: true,
         pingTimeout: 5000,
+        pingCacheMinutes: 10,
+        nodePanelPingAutoSort: false,
         upstreamTimeoutMs: 30000,
         upstreamRetryAttempts: 1
       },
@@ -3916,6 +4257,10 @@ const UI_HTML = `<!DOCTYPE html>
       loginPromise: null,
       chart: null,
       settingsGuardrailsBound: false,
+      nodeModalLines: [],
+      nodeLineDragId: '',
+      nodeLineDropHint: null,
+      nodeLineMouseDragBlocked: false,
 
       safeCreateIcons(opts = {}) {
           if (typeof window.lucide !== 'undefined') {
@@ -4373,6 +4718,252 @@ const UI_HTML = `<!DOCTYPE html>
         }
         alert(message);
       },
+      createLineId() {
+        return 'line-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      },
+      buildDefaultLineName(index) {
+        return '线路' + (Number(index) + 1);
+      },
+      getNextDefaultLineName(lines = []) {
+        const usedNames = new Set((Array.isArray(lines) ? lines : []).map(line => String(line?.name || '').trim()));
+        let cursor = 1;
+        while (usedNames.has('线路' + cursor)) cursor += 1;
+        return '线路' + cursor;
+      },
+      normalizeSingleTarget(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return '';
+        try {
+          const url = new URL(raw);
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+          return url.toString().replace(/\\/$/, '');
+        } catch {
+          return '';
+        }
+      },
+      validateSingleTarget(value) {
+        return !!this.normalizeSingleTarget(value);
+      },
+      normalizeNodeLines(lines, fallbackTarget = '') {
+        const sourceLines = Array.isArray(lines) && lines.length
+          ? lines
+          : String(fallbackTarget || '')
+              .split(',')
+              .map(item => item.trim())
+              .filter(Boolean)
+              .map((target, index) => ({
+                id: 'line-' + (index + 1),
+                name: this.buildDefaultLineName(index),
+                target
+              }));
+        if (!sourceLines.length) return [];
+
+        const result = [];
+        const usedIds = new Set();
+        sourceLines.forEach((item, index) => {
+          const line = item && typeof item === 'object' && !Array.isArray(item) ? item : { target: item };
+          const target = this.normalizeSingleTarget(line?.target);
+          if (!target) return;
+          let nextId = this.normalizeNodeKey(line?.id) || ('line-' + (index + 1));
+          let suffix = 2;
+          while (usedIds.has(nextId)) {
+            nextId = (this.normalizeNodeKey(line?.id) || ('line-' + (index + 1))) + '-' + suffix;
+            suffix += 1;
+          }
+          usedIds.add(nextId);
+          const latencyValue = Number(line?.latencyMs);
+          const checkedAt = line?.latencyUpdatedAt ? new Date(line.latencyUpdatedAt) : null;
+          result.push({
+            id: nextId,
+            name: String(line?.name || '').trim() || this.buildDefaultLineName(index),
+            target,
+            latencyMs: Number.isFinite(latencyValue) && latencyValue >= 0 ? Math.round(latencyValue) : null,
+            latencyUpdatedAt: checkedAt && Number.isFinite(checkedAt.getTime()) ? checkedAt.toISOString() : ''
+          });
+        });
+        return result;
+      },
+      buildLegacyTargetFromLines(lines = []) {
+        return (Array.isArray(lines) ? lines : [])
+          .map(line => String(line?.target || '').trim())
+          .filter(Boolean)
+          .join(',');
+      },
+      resolveActiveLineId(activeLineId, lines = []) {
+        const normalizedId = this.normalizeNodeKey(activeLineId);
+        if (normalizedId && lines.some(line => String(line?.id || '') === normalizedId)) return normalizedId;
+        return lines[0]?.id || '';
+      },
+      getNodeLines(node) {
+        return this.normalizeNodeLines(node?.lines, node?.target || '');
+      },
+      getActiveNodeLine(node) {
+        const lines = this.getNodeLines(node);
+        if (!lines.length) return null;
+        const activeLineId = this.resolveActiveLineId(node?.activeLineId, lines);
+        return lines.find(line => line.id === activeLineId) || lines[0];
+      },
+      hydrateNode(node) {
+        if (!node || typeof node !== 'object') return node;
+        const lines = this.getNodeLines(node);
+        const activeLineId = this.resolveActiveLineId(node.activeLineId, lines);
+        return {
+          ...node,
+          lines,
+          activeLineId,
+          target: this.buildLegacyTargetFromLines(lines)
+        };
+      },
+      upsertNode(nextNode) {
+        if (!nextNode?.name) return;
+        const hydratedNode = this.hydrateNode(nextNode);
+        const nextKey = this.normalizeNodeKey(hydratedNode.name);
+        const index = this.nodes.findIndex(node => this.normalizeNodeKey(node?.name) === nextKey);
+        if (index > -1) this.nodes[index] = hydratedNode;
+        else this.nodes.push(hydratedNode);
+      },
+      formatLatency(ms) {
+        const latency = Number(ms);
+        if (!Number.isFinite(latency)) return '--';
+        return latency > 5000 ? 'Timeout' : (Math.round(latency) + ' ms');
+      },
+      sortLinesByLatency(lines = []) {
+        return (Array.isArray(lines) ? lines : [])
+          .map((line, index) => ({ line, index }))
+          .sort((left, right) => {
+            const leftMs = Number.isFinite(left.line?.latencyMs) ? left.line.latencyMs : Number.POSITIVE_INFINITY;
+            const rightMs = Number.isFinite(right.line?.latencyMs) ? right.line.latencyMs : Number.POSITIVE_INFINITY;
+            if (leftMs !== rightMs) return leftMs - rightMs;
+            return left.index - right.index;
+          })
+          .map(item => item.line);
+      },
+      isNodePanelPingAutoSortEnabled() {
+        if (this.runtimeConfig?.nodePanelPingAutoSort === true) return true;
+        if (this.runtimeConfig?.nodePanelPingAutoSort === false) return false;
+        return document.getElementById('cfg-node-panel-ping-auto-sort')?.checked === true;
+      },
+      buildActiveLinePingPayload(nodeOrName) {
+        const node = typeof nodeOrName === 'string'
+          ? this.nodes.find(item => this.normalizeNodeKey(item?.name) === this.normalizeNodeKey(nodeOrName))
+          : nodeOrName;
+        const payload = { name: typeof nodeOrName === 'string' ? nodeOrName : String(node?.name || '') };
+        const activeLineId = this.getActiveNodeLine(node)?.id || '';
+        if (activeLineId) {
+          payload.lineId = activeLineId;
+          payload.silent = true;
+        }
+        return payload;
+      },
+      clearNodeLineDragState(options = {}) {
+        this.nodeLineDragId = '';
+        this.nodeLineDropHint = null;
+        if (options.render !== false) this.renderNodeLinesEditor();
+      },
+      isNodeLineInteractiveTarget(target) {
+        if (!target) return false;
+        const tagName = String(target.tagName || '').toLowerCase();
+        if (['input', 'button', 'textarea', 'select', 'option', 'label', 'a'].includes(tagName)) return true;
+        const role = String(target.getAttribute?.('role') || '').toLowerCase();
+        if (['button', 'textbox', 'radio', 'link'].includes(role)) return true;
+        if (typeof target.closest === 'function') {
+          return !!target.closest('input, button, textarea, select, option, label, a, [role="button"], [role="textbox"], [role="radio"], [role="link"]');
+        }
+        return false;
+      },
+      moveNodeLineTo(lineId, targetLineId, placement = 'before') {
+        const fromIndex = this.nodeModalLines.findIndex(line => line.id === lineId);
+        const targetIndex = this.nodeModalLines.findIndex(line => line.id === targetLineId);
+        if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return;
+        const [line] = this.nodeModalLines.splice(fromIndex, 1);
+        const adjustedTargetIndex = fromIndex < targetIndex ? targetIndex - 1 : targetIndex;
+        const insertIndex = placement === 'after' ? adjustedTargetIndex + 1 : adjustedTargetIndex;
+        this.nodeModalLines.splice(insertIndex, 0, line);
+      },
+      handleNodeLineDragStart(lineId, event) {
+        if (this.nodeLineMouseDragBlocked) {
+          this.nodeLineMouseDragBlocked = false;
+          event?.preventDefault?.();
+          return;
+        }
+        this.nodeLineDragId = lineId;
+        this.nodeLineDropHint = null;
+        if (event?.dataTransfer) {
+          event.dataTransfer.effectAllowed = 'move';
+          try { event.dataTransfer.setData('text/plain', lineId); } catch {}
+        }
+      },
+      handleNodeLineDragOver(lineId, event) {
+        if (!this.nodeLineDragId || this.nodeLineDragId === lineId) return;
+        if (event?.preventDefault) event.preventDefault();
+        if (event?.dataTransfer) event.dataTransfer.dropEffect = 'move';
+        const currentTarget = event?.currentTarget;
+        let placement = 'before';
+        if (currentTarget && typeof currentTarget.getBoundingClientRect === 'function' && Number.isFinite(event?.clientY)) {
+          const rect = currentTarget.getBoundingClientRect();
+          placement = event.clientY >= rect.top + (rect.height / 2) ? 'after' : 'before';
+        }
+        const prevHint = this.nodeLineDropHint;
+        if (!prevHint || prevHint.lineId !== lineId || prevHint.placement !== placement) {
+          this.nodeLineDropHint = { lineId, placement };
+          this.renderNodeLinesEditor();
+        }
+      },
+      handleNodeLineDrop(lineId, event) {
+        if (event?.preventDefault) event.preventDefault();
+        if (!this.nodeLineDragId || this.nodeLineDragId === lineId) {
+          this.clearNodeLineDragState();
+          return;
+        }
+        const placement = this.nodeLineDropHint?.lineId === lineId ? this.nodeLineDropHint.placement : 'before';
+        this.moveNodeLineTo(this.nodeLineDragId, lineId, placement);
+        this.clearNodeLineDragState();
+      },
+      handleNodeLineDragEnd() {
+        if (!this.nodeLineDragId && !this.nodeLineDropHint) return;
+        this.clearNodeLineDragState();
+      },
+      async pingAllNodeLinesInModal(event) {
+        const button = event?.currentTarget;
+        const originalText = button?.textContent || '一键测试延迟';
+        const validLines = this.nodeModalLines.filter(line => this.validateSingleTarget(line?.target));
+        const autoSortEnabled = this.isNodePanelPingAutoSortEnabled();
+        if (!validLines.length) {
+          alert('请先至少填写一条有效的 http/https 目标源站');
+          return;
+        }
+        if (button) {
+          button.disabled = true;
+          button.textContent = '测试中...';
+        }
+        try {
+          const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
+          for (let index = 0; index < validLines.length; index++) {
+            const line = validLines[index];
+            if (button) button.textContent = '测试中 ' + (index + 1) + '/' + validLines.length;
+            try {
+              const normalizedTarget = this.normalizeSingleTarget(line.target);
+              const res = await this.apiCall('pingNode', { target: normalizedTarget, timeout, forceRefresh: true });
+              line.target = normalizedTarget;
+              line.latencyMs = Number(res?.ms);
+              line.latencyUpdatedAt = new Date().toISOString();
+            } catch {
+              line.latencyMs = 9999;
+              line.latencyUpdatedAt = new Date().toISOString();
+            }
+          }
+          if (autoSortEnabled) {
+            this.nodeModalLines = this.sortLinesByLatency(this.nodeModalLines);
+            this.syncNodeModalActiveLine(this.nodeModalLines[0]?.id || '');
+          }
+          this.renderNodeLinesEditor();
+        } finally {
+          if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+          }
+        }
+      },
 
       updateSourceDirectNodesSummary() {
         const summary = document.getElementById('cfg-source-direct-nodes-summary');
@@ -4471,16 +5062,187 @@ const UI_HTML = `<!DOCTYPE html>
       validateTargets(targetValue) {
         const targets = String(targetValue || "").split(",").map(function (item) { return item.trim(); }).filter(Boolean);
         if (!targets.length) return false;
-        return targets.every(function (item) {
-          try {
-            const url = new URL(item);
-            return url.protocol === "http:" || url.protocol === "https:";
-          } catch {
-            return false;
-          }
-        });
+        return targets.every(item => this.validateSingleTarget(item));
       },
+      ensureNodeModalLines(lines = [], fallbackTarget = '') {
+        const normalized = this.normalizeNodeLines(lines, fallbackTarget);
+        this.nodeModalLines = normalized.length
+          ? normalized
+          : [{
+              id: this.createLineId(),
+              name: this.buildDefaultLineName(0),
+              target: '',
+              latencyMs: null,
+              latencyUpdatedAt: ''
+            }];
+        return this.nodeModalLines;
+      },
+      syncNodeModalActiveLine(preferredId = '') {
+        const activeField = document.getElementById('form-active-line-id');
+        if (!activeField) return '';
+        const nextId = this.resolveActiveLineId(preferredId || activeField.value, this.nodeModalLines);
+        activeField.value = nextId;
+        return nextId;
+      },
+      renderNodeLinesEditor() {
+        const container = document.getElementById('node-lines-container');
+        if (!container) return;
+        if (!Array.isArray(this.nodeModalLines) || !this.nodeModalLines.length) this.ensureNodeModalLines();
+        const activeLineId = this.syncNodeModalActiveLine();
+        const desktopDragEnabled = Number(window?.innerWidth || 0) >= 768;
+        container.innerHTML = '';
 
+        this.nodeModalLines.forEach((line, index) => {
+          const row = document.createElement('div');
+          const isDragging = this.nodeLineDragId === line.id;
+          const dropPlacement = this.nodeLineDropHint?.lineId === line.id ? this.nodeLineDropHint.placement : '';
+          row.className = 'rounded-2xl border border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-900/90 p-3 transition'
+            + (isDragging ? ' opacity-60 ring-2 ring-brand-200 dark:ring-brand-500/20' : '')
+            + (dropPlacement === 'before' ? ' border-t-brand-500 border-t-4 pt-[10px]' : '')
+            + (dropPlacement === 'after' ? ' border-b-brand-500 border-b-4 pb-[10px]' : '')
+            + (desktopDragEnabled ? ' md:cursor-grab' : '');
+          row.draggable = desktopDragEnabled;
+          row.dataset.nodeLineRow = '1';
+          row.dataset.lineId = line.id;
+          row.addEventListener('mousedown', (event) => {
+            this.nodeLineMouseDragBlocked = this.isNodeLineInteractiveTarget(event?.target);
+          });
+          row.addEventListener('dragstart', (event) => this.handleNodeLineDragStart(line.id, event));
+          row.addEventListener('dragend', () => this.handleNodeLineDragEnd());
+          row.addEventListener('dragover', (event) => this.handleNodeLineDragOver(line.id, event));
+          row.addEventListener('drop', (event) => this.handleNodeLineDrop(line.id, event));
+
+          const mobileHead = document.createElement('div');
+          mobileHead.className = 'md:hidden flex items-center justify-between gap-3 mb-3';
+          const mobileLabel = document.createElement('div');
+          mobileLabel.className = 'text-xs font-semibold tracking-[0.1em] uppercase text-slate-400';
+          mobileLabel.textContent = '线路 ' + (index + 1);
+          const mobileBadge = document.createElement('span');
+          mobileBadge.className = 'inline-flex items-center rounded-full bg-slate-100 dark:bg-slate-800 px-2.5 py-1 text-[11px] font-medium text-slate-500 dark:text-slate-300';
+          mobileBadge.textContent = line.name || this.buildDefaultLineName(index);
+          mobileHead.appendChild(mobileLabel);
+          mobileHead.appendChild(mobileBadge);
+
+          const grid = document.createElement('div');
+          grid.className = 'grid gap-3 md:grid-cols-[88px_1.15fr_2.1fr_92px_164px] md:items-center';
+
+          const radioWrap = document.createElement('label');
+          radioWrap.className = 'flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300';
+          const radio = document.createElement('input');
+          radio.type = 'radio';
+          radio.name = 'node-active-line';
+          radio.className = 'w-4 h-4';
+          radio.checked = activeLineId === line.id;
+          radio.addEventListener('change', () => {
+            document.getElementById('form-active-line-id').value = line.id;
+          });
+          const radioText = document.createElement('span');
+          radioText.textContent = '启用';
+          radioWrap.appendChild(radio);
+          radioWrap.appendChild(radioText);
+
+          const nameInput = document.createElement('input');
+          nameInput.type = 'text';
+          nameInput.value = line.name || '';
+          nameInput.placeholder = this.buildDefaultLineName(index);
+          nameInput.className = 'w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white';
+          nameInput.addEventListener('input', (event) => {
+            line.name = event.currentTarget.value;
+          });
+
+          const targetInput = document.createElement('input');
+          targetInput.type = 'url';
+          targetInput.value = line.target || '';
+          targetInput.placeholder = 'https://emby.example.com';
+          targetInput.className = 'w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 outline-none text-sm text-slate-900 dark:text-white';
+          targetInput.addEventListener('input', (event) => {
+            line.target = event.currentTarget.value;
+          });
+
+          const latency = document.createElement('div');
+          latency.className = 'text-sm font-medium text-slate-500 dark:text-slate-300';
+          latency.textContent = this.formatLatency(line.latencyMs);
+          latency.title = line.latencyUpdatedAt ? ('最近测速：' + this.formatLocalDateTime(line.latencyUpdatedAt)) : '尚未测速';
+
+          const actions = document.createElement('div');
+          actions.className = 'flex items-center gap-2';
+
+          const dragHandle = document.createElement('button');
+          dragHandle.type = 'button';
+          dragHandle.className = 'px-2.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 transition';
+          dragHandle.title = '整行可拖拽排序';
+          dragHandle.innerHTML = '<i data-lucide="grip-vertical" class="w-4 h-4"></i>';
+          dragHandle.disabled = true;
+
+          const upBtn = document.createElement('button');
+          upBtn.type = 'button';
+          upBtn.className = 'px-2.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40';
+          upBtn.disabled = index === 0;
+          upBtn.innerHTML = '<i data-lucide="arrow-up" class="w-4 h-4"></i>';
+          upBtn.addEventListener('click', () => this.moveNodeLine(line.id, -1));
+
+          const downBtn = document.createElement('button');
+          downBtn.type = 'button';
+          downBtn.className = 'px-2.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-500 hover:bg-slate-50 dark:hover:bg-slate-800 transition disabled:opacity-40';
+          downBtn.disabled = index === this.nodeModalLines.length - 1;
+          downBtn.innerHTML = '<i data-lucide="arrow-down" class="w-4 h-4"></i>';
+          downBtn.addEventListener('click', () => this.moveNodeLine(line.id, 1));
+
+          const deleteBtn = document.createElement('button');
+          deleteBtn.type = 'button';
+          deleteBtn.className = 'px-2.5 py-2 rounded-xl border border-red-100 dark:border-red-900/30 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition';
+          deleteBtn.innerHTML = '<i data-lucide="trash-2" class="w-4 h-4"></i>';
+          deleteBtn.disabled = this.nodeModalLines.length <= 1;
+          deleteBtn.addEventListener('click', () => this.removeNodeLine(line.id));
+
+          actions.appendChild(dragHandle);
+          actions.appendChild(upBtn);
+          actions.appendChild(downBtn);
+          actions.appendChild(deleteBtn);
+
+          row.appendChild(mobileHead);
+          grid.appendChild(radioWrap);
+          grid.appendChild(nameInput);
+          grid.appendChild(targetInput);
+          grid.appendChild(latency);
+          grid.appendChild(actions);
+          row.appendChild(grid);
+          container.appendChild(row);
+        });
+
+        this.safeCreateIcons({ root: container });
+      },
+      addNodeLine() {
+        if (!Array.isArray(this.nodeModalLines)) this.nodeModalLines = [];
+        this.nodeModalLines.push({
+          id: this.createLineId(),
+          name: this.getNextDefaultLineName(this.nodeModalLines),
+          target: '',
+          latencyMs: null,
+          latencyUpdatedAt: ''
+        });
+        this.syncNodeModalActiveLine();
+        this.renderNodeLinesEditor();
+      },
+      moveNodeLine(lineId, delta) {
+        const index = this.nodeModalLines.findIndex(line => line.id === lineId);
+        const nextIndex = index + delta;
+        if (index < 0 || nextIndex < 0 || nextIndex >= this.nodeModalLines.length) return;
+        const [line] = this.nodeModalLines.splice(index, 1);
+        this.nodeModalLines.splice(nextIndex, 0, line);
+        this.renderNodeLinesEditor();
+      },
+      removeNodeLine(lineId) {
+        const activeField = document.getElementById('form-active-line-id');
+        this.nodeModalLines = this.nodeModalLines.filter(line => line.id !== lineId);
+        if (!this.nodeModalLines.length) {
+          this.ensureNodeModalLines();
+        }
+        if (activeField && activeField.value === lineId) {
+          activeField.value = this.nodeModalLines[0]?.id || '';
+        }
+        this.renderNodeLinesEditor();
+      },
       async promptLogin() {
         if (this.loginPromise) return this.loginPromise;
         this.loginPromise = (async () => {
@@ -4744,7 +5506,9 @@ const UI_HTML = `<!DOCTYPE html>
 
       syncSettingsSplitLayout(hash) {
         const isDesktopSettings = hash === '#settings' && window.innerWidth >= 768;
-        document.body.classList.toggle('settings-split-layout', isDesktopSettings);
+        if (document.body && document.body.classList) {
+          document.body.classList.toggle('settings-split-layout', isDesktopSettings);
+        }
         if (!isDesktopSettings) return;
         const contentArea = document.getElementById('content-area');
         const settingsForms = document.getElementById('settings-forms');
@@ -4896,7 +5660,7 @@ const UI_HTML = `<!DOCTYPE html>
           ]);
           const cfg = configRes.config || { enableH2: false, enableH3: false, peakDowngrade: true, protocolFallback: true, sourceSameOriginProxy: true, forceExternalProxy: true };
           this.applyRuntimeConfig(cfg);
-          if (Array.isArray(nodesRes.nodes)) this.nodes = nodesRes.nodes;
+          if (Array.isArray(nodesRes.nodes)) this.nodes = nodesRes.nodes.map(node => this.hydrateNode(node));
           this.renderConfigSnapshots(snapshotRes.snapshots || []);
 
           this.applyConfigSectionToForm('ui', cfg);
@@ -4991,7 +5755,7 @@ const UI_HTML = `<!DOCTYPE html>
 
       async loadNodes() {
           const res = await this.apiCall('list');
-          if(res.nodes) { this.nodes = res.nodes; this.renderNodesGrid(); }
+          if(res.nodes) { this.nodes = res.nodes.map(node => this.hydrateNode(node)); this.renderNodesGrid(); }
       },
 
       async forceHealthCheck(event) {
@@ -5011,10 +5775,10 @@ const UI_HTML = `<!DOCTYPE html>
           this.safeCreateIcons({root: btnEl.parentElement});
           
           try {
-             // 🌟 走 Worker API 测算真实的 CF 边缘到源站延迟
              const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
-             const res = await this.apiCall('pingNode', { name, timeout });
-             this.updateNodeCardStatus(name, res.ms || 9999);
+             const res = await this.apiCall('pingNode', { ...this.buildActiveLinePingPayload(name), timeout, forceRefresh: true });
+             if (res?.node) this.upsertNode(res.node);
+             this.renderNodesGrid();
           } catch(e) {
              this.updateNodeCardStatus(name, 9999);
           }
@@ -5025,14 +5789,15 @@ const UI_HTML = `<!DOCTYPE html>
 
       async checkAllNodesHealth() {
           const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
-          for(let n of this.nodes) {
+          for(let n of this.nodes.slice()) {
              try {
-                const res = await this.apiCall('pingNode', { name: n.name, timeout });
-                this.updateNodeCardStatus(n.name, res.ms || 9999);
+                const res = await this.apiCall('pingNode', { ...this.buildActiveLinePingPayload(n), timeout, forceRefresh: true });
+                if (res?.node) this.upsertNode(res.node);
              } catch(e) {
                 this.updateNodeCardStatus(n.name, 9999);
              }
           }
+          this.renderNodesGrid();
       },
       
       updateNodeCardStatus(name, ms) {
@@ -5076,7 +5841,15 @@ const UI_HTML = `<!DOCTYPE html>
 
       renderNodesGrid() {
         const keyword = document.getElementById('node-search')?.value.toLowerCase() || '';
-        const filteredNodes = this.nodes.filter(n => n.name.toLowerCase().includes(keyword) || (n.tag && n.tag.toLowerCase().includes(keyword)));
+        const filteredNodes = this.nodes
+          .map(node => this.hydrateNode(node))
+          .filter(n => {
+            const lineNames = this.getNodeLines(n).map(line => line.name).join(' ').toLowerCase();
+            return n.name.toLowerCase().includes(keyword)
+              || (n.tag && n.tag.toLowerCase().includes(keyword))
+              || (n.remark && n.remark.toLowerCase().includes(keyword))
+              || lineNames.includes(keyword);
+          });
         const grid = document.getElementById('nodes-grid');
         grid.innerHTML = '';
 
@@ -5091,6 +5864,8 @@ const UI_HTML = `<!DOCTYPE html>
         const fragment = document.createDocumentFragment();
         filteredNodes.forEach(n => {
           const link = this.buildNodeLink(n);
+          const activeLine = this.getActiveNodeLine(n);
+          const nodeLines = this.getNodeLines(n);
           const dotId = this.safeDomId('dot', n.name);
           const titleId = this.safeDomId('title', n.name);
           const latId = this.safeDomId('lat', n.name);
@@ -5101,17 +5876,31 @@ const UI_HTML = `<!DOCTYPE html>
 
           const top = document.createElement('div');
           const headerRow = document.createElement('div');
-          headerRow.className = 'flex items-center mb-1 w-full';
+          headerRow.className = 'flex items-start mb-2 w-full gap-3';
           const dot = document.createElement('span');
           dot.id = dotId;
-          // 使用 Tailwind 设置默认的中性灰/暗灰，并加上内阴影
-          dot.className = 'w-3 h-3 rounded-full mr-3 bg-slate-200 dark:bg-slate-700 transition-colors duration-500 flex-shrink-0 shadow-inner';
+          dot.className = 'w-3 h-3 rounded-full mt-1 bg-slate-200 dark:bg-slate-700 transition-colors duration-500 flex-shrink-0 shadow-inner';
+          const titleWrap = document.createElement('div');
+          titleWrap.className = 'flex-1 min-w-0 flex flex-wrap items-center gap-2';
           const title = document.createElement('h3');
           title.id = titleId;
-          title.className = 'font-semibold text-lg transition-colors flex-1 min-w-0 truncate';
+          title.className = 'font-semibold text-lg transition-colors min-w-0 truncate';
           title.textContent = n.name;
+          const activeBadge = document.createElement('span');
+          activeBadge.className = 'inline-flex max-w-full flex-shrink-0 items-center gap-1.5 rounded-full border border-emerald-300 bg-gradient-to-r from-emerald-500 via-teal-500 to-cyan-500 px-3 py-1 text-[11px] font-black tracking-[0.08em] text-white dark:border-emerald-400/30';
+          activeBadge.title = '当前启用线路';
+          const activeBadgeIcon = document.createElement('i');
+          activeBadgeIcon.setAttribute('data-lucide', 'route');
+          activeBadgeIcon.className = 'w-3.5 h-3.5 flex-shrink-0';
+          const activeBadgeText = document.createElement('span');
+          activeBadgeText.className = 'truncate max-w-[9rem]';
+          activeBadgeText.textContent = activeLine?.name || '未启用线路';
+          activeBadge.appendChild(activeBadgeIcon);
+          activeBadge.appendChild(activeBadgeText);
           headerRow.appendChild(dot);
-          headerRow.appendChild(title);
+          titleWrap.appendChild(title);
+          titleWrap.appendChild(activeBadge);
+          headerRow.appendChild(titleWrap);
 
           const metaRow = document.createElement('div');
           metaRow.className = 'text-xs text-slate-400 mb-2 flex justify-between tracking-wider';
@@ -5119,8 +5908,7 @@ const UI_HTML = `<!DOCTYPE html>
           pingLabel.textContent = 'Ping: ';
           const pingValue = document.createElement('span');
           pingValue.id = latId;
-          pingValue.textContent = '--';
-          // 使用 Tailwind 统一设置文本样式
+          pingValue.textContent = this.formatLatency(activeLine?.latencyMs);
           pingValue.className = 'text-slate-500 dark:text-slate-400 font-medium';
           pingLabel.appendChild(pingValue);
           const shield = document.createElement('span');
@@ -5135,6 +5923,16 @@ const UI_HTML = `<!DOCTYPE html>
 
           const detailWrap = document.createElement('div');
           detailWrap.className = 'text-xs text-slate-500 dark:text-slate-400 mb-3 space-y-1';
+          const lineRow = document.createElement('div');
+          lineRow.className = 'flex items-center min-w-0';
+          const lineIcon = document.createElement('i');
+          lineIcon.setAttribute('data-lucide', 'route');
+          lineIcon.className = 'w-3 h-3 mr-1.5 flex-shrink-0 text-emerald-500';
+          const lineText = document.createElement('span');
+          lineText.className = 'truncate flex-1 min-w-0';
+          lineText.textContent = '当前线路：' + (activeLine?.name || '未启用') + ' / 共 ' + nodeLines.length + ' 条';
+          lineRow.appendChild(lineIcon);
+          lineRow.appendChild(lineText);
           const tagRow = document.createElement('div');
           tagRow.className = 'flex items-center min-w-0';
           const tagIcon = document.createElement('i');
@@ -5157,6 +5955,7 @@ const UI_HTML = `<!DOCTYPE html>
           remarkRow.appendChild(remarkText);
           detailWrap.appendChild(tagRow);
           detailWrap.appendChild(remarkRow);
+          detailWrap.appendChild(lineRow);
 
           top.appendChild(headerRow);
           top.appendChild(metaRow);
@@ -5190,7 +5989,7 @@ const UI_HTML = `<!DOCTYPE html>
           const pingBtn = document.createElement('button');
           pingBtn.type = 'button';
           pingBtn.className = 'px-3 border border-emerald-200 dark:border-emerald-800/50 text-emerald-600 dark:text-emerald-400 rounded-xl hover:bg-emerald-50 dark:hover:bg-emerald-900/30 transition flex items-center justify-center flex-shrink-0';
-          pingBtn.title = '独立节点测速';
+          pingBtn.title = '测试当前启用线路';
           const pingIconBtn = document.createElement('i');
           pingIconBtn.setAttribute('data-lucide', 'activity');
           pingIconBtn.className = 'w-4 h-4';
@@ -5241,6 +6040,12 @@ const UI_HTML = `<!DOCTYPE html>
         });
 
         grid.appendChild(fragment);
+        filteredNodes.forEach(node => {
+          const activeLine = this.getActiveNodeLine(node);
+          if (Number.isFinite(activeLine?.latencyMs)) {
+            this.updateNodeCardStatus(node.name, activeLine.latencyMs);
+          }
+        });
         this.safeCreateIcons({root: grid});
       },
 
@@ -5284,13 +6089,15 @@ const UI_HTML = `<!DOCTYPE html>
         if(name) {
             const n = this.nodes.find(x => String(x.name) === String(name));
             if(n) {
+                const hydratedNode = this.hydrateNode(n);
                 document.getElementById('form-original-name').value = n.name; 
                 document.getElementById('form-name').value = n.name;
                 document.getElementById('form-name').readOnly = false; 
-                document.getElementById('form-target').value = n.target;
                 document.getElementById('form-secret').value = n.secret || ''; 
                 document.getElementById('form-tag').value = n.tag || '';
                 document.getElementById('form-remark').value = n.remark || ''; 
+                this.ensureNodeModalLines(hydratedNode.lines, hydratedNode.target);
+                document.getElementById('form-active-line-id').value = hydratedNode.activeLineId || this.nodeModalLines[0]?.id || '';
                 
                 if (n.headers && typeof n.headers === 'object') {
                     for (const [k, v] of Object.entries(n.headers)) {
@@ -5300,8 +6107,11 @@ const UI_HTML = `<!DOCTYPE html>
             }
         } else {
             document.getElementById('form-original-name').value = '';
+            this.ensureNodeModalLines();
+            document.getElementById('form-active-line-id').value = this.nodeModalLines[0]?.id || '';
             this.addHeaderRow(); 
         }
+        this.renderNodeLinesEditor();
         document.getElementById('node-modal').showModal();
       },
       
@@ -5322,17 +6132,38 @@ const UI_HTML = `<!DOCTYPE html>
           const payload = {
               originalName: document.getElementById('form-original-name').value,
               name: document.getElementById('form-name').value.trim(),
-              target: document.getElementById('form-target').value.trim(),
               secret: document.getElementById('form-secret').value.trim(),
               tag: document.getElementById('form-tag').value.trim(),
               remark: document.getElementById('form-remark').value.trim(),
               headers: headersObj
           };
 
-          if (!this.validateTargets(payload.target)) {
-              alert('目标源站必须是有效的 http/https URL，多个源站请用英文逗号分隔');
+          const normalizedLines = [];
+          for (let index = 0; index < this.nodeModalLines.length; index++) {
+              const rawLine = this.nodeModalLines[index] || {};
+              const hasAnyValue = String(rawLine.name || '').trim() || String(rawLine.target || '').trim() || Number.isFinite(Number(rawLine.latencyMs));
+              if (!hasAnyValue) continue;
+              const target = this.normalizeSingleTarget(rawLine.target);
+              if (!target) {
+                  alert('每条线路都必须填写有效的 http/https 目标源站');
+                  return;
+              }
+              normalizedLines.push({
+                  id: this.normalizeNodeKey(rawLine.id) || this.createLineId(),
+                  name: String(rawLine.name || '').trim() || this.buildDefaultLineName(index),
+                  target,
+                  latencyMs: Number.isFinite(Number(rawLine.latencyMs)) ? Math.round(Number(rawLine.latencyMs)) : null,
+                  latencyUpdatedAt: rawLine.latencyUpdatedAt || ''
+              });
+          }
+
+          if (!normalizedLines.length) {
+              alert('至少需要保留一条有效线路');
               return;
           }
+          payload.lines = normalizedLines;
+          payload.activeLineId = this.resolveActiveLineId(document.getElementById('form-active-line-id').value, normalizedLines);
+          payload.target = this.buildLegacyTargetFromLines(normalizedLines);
 
           if (submitBtn) {
               submitBtn.disabled = true;
@@ -5352,6 +6183,8 @@ const UI_HTML = `<!DOCTYPE html>
               ...(previousNode || {}),
               name: payload.name,
               target: payload.target,
+              lines: payload.lines,
+              activeLineId: payload.activeLineId,
               secret: payload.secret,
               tag: payload.tag,
               remark: payload.remark,
@@ -5370,16 +6203,7 @@ const UI_HTML = `<!DOCTYPE html>
           this.apiCall('save', payload).then(res => {
               if (!this.isNodeMutationCurrent([...mutationNames, res?.node?.name], mutationId)) return;
               if (res && res.node) {
-                  const finalIdx = this.nodes.findIndex(n =>
-                      this.normalizeNodeKey(n?.name) === this.normalizeNodeKey(res.node.name)
-                  );
-
-                  if (finalIdx > -1) {
-                      this.nodes[finalIdx] = res.node;
-                  } else {
-                      this.nodes.push(res.node);
-                  }
-
+                  this.upsertNode(res.node);
                   this.renderNodesGrid();
               }
           }).catch(err => {
@@ -5735,7 +6559,7 @@ const UI_HTML = `<!DOCTYPE html>
 // - `scheduled` 负责日志清理与日报等定时任务。
 // ============================================================================
 function renderLandingPage() {
-  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.2</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.2</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Proxy V18.3</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-950 flex items-center justify-center min-h-screen text-center"><div class="p-8 max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl"><div class="w-16 h-16 mx-auto bg-brand-500/20 rounded-2xl flex items-center justify-center text-blue-500 mb-6"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></div><h1 class="text-3xl font-bold text-white mb-2">Emby Proxy V18.3</h1><p class="text-slate-400 mb-8">高性能媒体代理与分流中心</p><a href="/admin" class="block w-full py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium transition">进入管理控制台</a></div></body></html>`;
   const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' });
   applySecurityHeaders(headers);
   headers.set('X-Frame-Options', 'DENY');
